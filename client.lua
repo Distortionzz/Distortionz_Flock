@@ -6,7 +6,13 @@
 
 local cameras     = {}      -- [id] = { prop, pole, blip, cfg }
 local cameraState = {}      -- [id] = online boolean
+local sparkFx     = {}      -- [id] = looped ptfx handle, while tampered/offline
 local hasAccess   = false
+
+-- Forward-declared: SpawnCamera (defined below) wires an ox_target option
+-- that calls this, but the actual tamper flow is defined further down,
+-- after the counterplay section it belongs with.
+local TryTamper
 
 local function DebugPrint(message)
     if Config.Debug then
@@ -107,6 +113,30 @@ local function SpawnCamera(cfg)
     end
 
     cameras[cfg.id] = { prop = prop, pole = pole, blip = nil, cfg = cfg }
+
+    -- Modern interaction path — the /flocktamper command (below) stays as
+    -- a fallback for servers without ox_target running. Registered on
+    -- BOTH the camera housing and the pole beneath it — the housing is a
+    -- small target mounted well above head height, so a player's
+    -- crosshair realistically lands on the much bigger pole instead.
+    if GetResourceState('ox_target') == 'started' then
+        local targets = pole and { prop, pole } or prop
+
+        pcall(function()
+            exports.ox_target:addLocalEntity(targets, {
+                {
+                    name     = 'flock_tamper_' .. cfg.id,
+                    icon     = 'fa-solid fa-bolt',
+                    label    = 'Tamper with camera',
+                    distance = Config.Counterplay.useRadius,
+                    onSelect = function() TryTamper(cfg.id) end,
+                    canInteract = function()
+                        return Config.Counterplay.enabled and cameraState[cfg.id] ~= false
+                    end,
+                },
+            })
+        end)
+    end
 end
 
 local function ApplyBlip(entry)
@@ -146,12 +176,50 @@ local function RefreshBlips()
     end
 end
 
+-- ─── Tamper sparks ──────────────────────────────────────────────────
+-- Purely cosmetic. 'core' is a base-game particle dict, always resident —
+-- no streaming asset to fail to load.
+
+local function StartSparks(cameraId, c)
+    if sparkFx[cameraId] then return end
+
+    RequestNamedPtfxAsset('core')
+    local deadline = GetGameTimer() + 2000
+    while not HasNamedPtfxAssetLoaded('core') and GetGameTimer() < deadline do
+        Wait(0)
+    end
+    if not HasNamedPtfxAssetLoaded('core') then return end
+
+    -- ent_brk_* effects are one-shot "just broke" reaction bursts — wrong
+    -- category regardless of calling them via the Looped native. ent_amb_*
+    -- is GTA's actual ambient/persistent effect naming convention.
+    UseParticleFxAssetNextCall('core')
+    sparkFx[cameraId] = StartParticleFxLoopedAtCoord(
+        'ent_amb_elec_crackle', c.x, c.y, c.z + 0.7, 0.0, 0.0, 0.0, 3.0, false, false, false, false)
+end
+
+local function StopSparks(cameraId)
+    local handle = sparkFx[cameraId]
+    if not handle then return end
+
+    if DoesParticleFxLoopedExist(handle) then
+        StopParticleFxLooped(handle, false)
+    end
+    sparkFx[cameraId] = nil
+end
+
 RegisterNetEvent('distortionz_flock:client:cameraState', function(cameraId, online)
     cameraState[cameraId] = online
 
     local entry = cameras[cameraId]
     if entry and entry.blip and DoesBlipExist(entry.blip) then
         SetBlipColour(entry.blip, online and (Config.Blip.color or 3) or 1)
+    end
+
+    if online then
+        StopSparks(cameraId)
+    elseif entry then
+        StartSparks(cameraId, entry.cfg.coords)
     end
 end)
 
@@ -441,14 +509,11 @@ local function NearestCamera()
     return best
 end
 
-RegisterCommand('flocktamper', function()
+--- Shared by both the /flocktamper command (proximity-based) and the
+--- ox_target option on the camera prop itself (id already known, no
+--- guessing needed) — one tamper flow, two ways to trigger it.
+TryTamper = function(cameraId)
     if not Config.Counterplay.enabled then return end
-
-    local cameraId = NearestCamera()
-    if not cameraId then
-        Notify('No camera within reach.', 'error')
-        return
-    end
 
     if cameraState[cameraId] == false then
         Notify('This camera is already offline.', 'error')
@@ -465,6 +530,20 @@ RegisterCommand('flocktamper', function()
     }) then
         TriggerServerEvent('distortionz_flock:server:tamper', cameraId)
     end
+end
+
+-- Command stays as a fallback for servers without ox_target — the target
+-- option below is the intended way to do this when it's running.
+RegisterCommand('flocktamper', function()
+    if not Config.Counterplay.enabled then return end
+
+    local cameraId = NearestCamera()
+    if not cameraId then
+        Notify('No camera within reach.', 'error')
+        return
+    end
+
+    TryTamper(cameraId)
 end, false)
 
 -- ─── Bootstrap ──────────────────────────────────────────────────────
@@ -499,6 +578,10 @@ end)
 
 AddEventHandler('onResourceStop', function(resourceName)
     if resourceName ~= GetCurrentResourceName() then return end
+
+    for id in pairs(sparkFx) do
+        StopSparks(id)
+    end
 
     for _, entry in pairs(cameras) do
         DeleteEntitySafe(entry.prop)

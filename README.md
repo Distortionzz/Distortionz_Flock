@@ -44,6 +44,7 @@ Speed detection specifically didn't start this way: this resource absorbed `dist
 | `distortionz_notify` | optional | Notifications; falls back to `lib.notify` |
 | `distortionz_cad` | optional | Dispatch calls on hotlist/BOLO/speed hits, and the source of truth for BOLO matches |
 | `ox_inventory` | optional | Only if `Config.Counterplay.item` is set |
+| `ox_target` | optional | Tamper cameras by targeting the prop directly; falls back to `/flocktamper` when absent |
 
 ## Installation
 

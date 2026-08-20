@@ -3,7 +3,7 @@ Config = {}
 Config.Debug = false       -- prints scan/read lines. Set false before shipping.
 
 Config.ResourceName   = 'distortionz_flock'
-Config.CurrentVersion = '2.0.0'
+Config.CurrentVersion = '2.1.0'
 
 -- ─── Version checker ────────────────────────────────────────────────
 Config.VersionCheck = {

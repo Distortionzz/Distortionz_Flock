@@ -4,7 +4,7 @@ lua54 'yes'
 
 author 'Distortionz'
 description 'Server-authoritative ALPR camera network for the Distortionz stack'
-version '1.1.0'
+version '2.1.0'
 repository 'https://github.com/Distortionzz/Distortionz_Flock'
 
 shared_scripts {
