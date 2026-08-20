@@ -45,3 +45,24 @@ CREATE TABLE IF NOT EXISTS `distortionz_flock_audit` (
     KEY `officer_cid` (`officer_cid`),
     KEY `created_at` (`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Speed camera citations (merged in from distortionz_speedcam). Kept
+-- separate from `_reads` above: violations are financial records and much
+-- lower volume (gated by over-limit + cooldown, not every pass), so they
+-- aren't subject to Config.Database.retentionDays pruning.
+CREATE TABLE IF NOT EXISTS `distortionz_flock_speed_violations` (
+    `id`           INT(11) NOT NULL AUTO_INCREMENT,
+    `camera_id`    VARCHAR(64) NOT NULL,
+    `camera_label` VARCHAR(120) DEFAULT NULL,
+    `plate`        VARCHAR(12) NOT NULL,
+    `citizenid`    VARCHAR(50) DEFAULT NULL,
+    `speed`        INT(11) NOT NULL,
+    `speed_limit`  INT(11) NOT NULL,
+    `fine_amount`  INT(11) NOT NULL DEFAULT 0,
+    `paid_from`    VARCHAR(16) DEFAULT NULL,   -- 'bank' | 'cash' | NULL (unbilled)
+    `created_at`   TIMESTAMP NOT NULL DEFAULT current_timestamp(),
+    PRIMARY KEY (`id`),
+    KEY `plate_time` (`plate`, `created_at`),
+    KEY `created_at` (`created_at`),
+    KEY `citizenid` (`citizenid`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

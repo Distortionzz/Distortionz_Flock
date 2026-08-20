@@ -121,16 +121,20 @@ local function ApplyBlip(entry)
 
     if entry.blip and DoesBlipExist(entry.blip) then return end
 
+    -- Per-camera style override, falling back to the global default.
+    -- Doesn't bypass the enabled/policeOnly gate above — that's a policy
+    -- decision, this is just look-and-feel.
+    local bcfg = cfg.blip or Config.Blip
     local c = cfg.coords
     local blip = AddBlipForCoord(c.x, c.y, c.z)
 
-    SetBlipSprite(blip, Config.Blip.sprite or 184)
-    SetBlipColour(blip, cameraState[cfg.id] == false and 1 or (Config.Blip.color or 3))
-    SetBlipScale(blip, Config.Blip.scale or 0.7)
-    SetBlipAsShortRange(blip, Config.Blip.shortRange ~= false)
+    SetBlipSprite(blip, bcfg.sprite or 184)
+    SetBlipColour(blip, cameraState[cfg.id] == false and 1 or (bcfg.color or 3))
+    SetBlipScale(blip, bcfg.scale or 0.7)
+    SetBlipAsShortRange(blip, bcfg.shortRange ~= false)
 
     BeginTextCommandSetBlipName('STRING')
-    AddTextComponentString(cfg.label or Config.Blip.label or 'Flock Camera')
+    AddTextComponentString(bcfg.label or cfg.label or 'Flock Camera')
     EndTextCommandSetBlipName(blip)
 
     entry.blip = blip
@@ -170,6 +174,36 @@ RegisterNetEvent('distortionz_flock:client:hit', function(payload)
 
     SetTimeout(payload.blipTimeoutMs or 60000, function()
         if DoesBlipExist(blip) then RemoveBlip(blip) end
+    end)
+end)
+
+-- ─── Speed camera flash ─────────────────────────────────────────────
+-- Purely cosmetic. Broadcast to everyone (server-side TriggerClientEvent
+-- to -1) rather than just the offending driver — DrawLightWithRange only
+-- renders for a client actually close enough to see it, so there's no
+-- need to compute "who's nearby": anyone standing near the camera sees
+-- an actual flash pop off it, plus the shutter sound.
+
+RegisterNetEvent('distortionz_flock:client:cameraFlash', function(coords)
+    if not coords then return end
+
+    PlaySoundFrontend(-1, 'Camera_Shoot', 'Phone_SoundSet_Franklin', true)
+
+    CreateThread(function()
+        -- A real flash bulb isn't one flat pulse — three quick pops with
+        -- brief dark gaps between reads far more like an actual camera
+        -- strobing than a single steady light.
+        local pulses = { 90, 60, 130 }
+
+        for i = 1, #pulses do
+            local deadline = GetGameTimer() + pulses[i]
+            while GetGameTimer() < deadline do
+                DrawLightWithRange(coords.x, coords.y, coords.z + 1.2, 255, 255, 255, 30.0, 25.0)
+                Wait(0)
+            end
+
+            if i < #pulses then Wait(40) end
+        end
     end)
 end)
 
@@ -433,346 +467,6 @@ RegisterCommand('flocktamper', function()
     end
 end, false)
 
--- ─── Live camera feed ───────────────────────────────────────────────
--- NUI cannot render the 3D world into a panel, so "live feed" means the
--- only honest thing it can mean: moving the officer's own render camera
--- to the physical camera's fixed position, in real time. distortionz_cad
--- calls StartFeed(id) as an export — this resource owns the whole feed,
--- CAD is just the button that triggers it.
-
-local inFeed             = false
-local feedCam            = nil
-local feedCameraId       = nil
-local feedEnterHealth    = 0
-local feedPan             = 0.0   -- current look heading, degrees, wraps 0-360
-local feedTilt            = 0.0   -- current look pitch, degrees, clamped
-local feedFov             = 50.0  -- current zoom, degrees FOV, clamped (lower = more zoomed in)
-local feedTraffic         = {}    -- { {veh=, ped=}, ... } — local-only, despawned on exit
-
--- ─── CCTV look ──────────────────────────────────────────────────────
--- Everything here is plain 2D draw natives (rects + text), not a
--- SetTimecycleModifier/AnimpostfxPlay asset name — those depend on a
--- specific game asset existing and fail silently if it doesn't. Rects
--- always render, so this can't ship broken.
-
-local function DrawScanline()
-    local period = 4000
-    local t = (GetGameTimer() % period) / period
-    DrawRect(0.5, t, 1.0, 0.003, 255, 255, 255, 26)
-end
-
-local function DrawCorner(x, y, flipX, flipY)
-    local len, thick = 0.018, 0.0025
-    local dx = flipX and -len or len
-    local dy = flipY and -len or len
-    DrawRect(x + dx / 2, y, math.abs(dx), thick, 225, 29, 42, 200)
-    DrawRect(x, y + dy / 2, thick, math.abs(dy), 225, 29, 42, 200)
-end
-
-local function DrawFeedHud(label, cameraId, online)
-    -- Faint monochrome-green wash over the frame.
-    DrawRect(0.5, 0.5, 1.0, 1.0, 20, 35, 20, 26)
-
-    if online then DrawScanline() end
-
-    DrawCorner(0.02, 0.09, false, false)
-    DrawCorner(0.98, 0.09, true, false)
-    DrawCorner(0.02, 0.94, false, true)
-    DrawCorner(0.98, 0.94, true, true)
-
-    DrawRect(0.5, 0.036, 1.0, 0.072, 8, 8, 10, 180)
-
-    if online and (GetGameTimer() % 1000) < 600 then
-        DrawRect(0.045, 0.036, 0.012, 0.020, 225, 29, 42, 230)
-    end
-
-    SetTextFont(4)
-    SetTextScale(0.36, 0.36)
-    SetTextColour(255, 255, 255, 230)
-    SetTextOutline()
-    BeginTextCommandDisplayText('STRING')
-    AddTextComponentSubstringPlayerName((online and '   REC   ' or '   OFFLINE   ') .. label)
-    EndTextCommandDisplayText(0.06, 0.018)
-
-    SetTextFont(4)
-    SetTextScale(0.22, 0.22)
-    SetTextColour(190, 195, 200, 200)
-    SetTextOutline()
-    BeginTextCommandDisplayText('STRING')
-    AddTextComponentSubstringPlayerName(cameraId:upper())
-    EndTextCommandDisplayText(0.84, 0.022)
-
-    SetTextFont(4)
-    SetTextScale(0.26, 0.26)
-    SetTextColour(190, 195, 200, 210)
-    SetTextOutline()
-    BeginTextCommandDisplayText('STRING')
-    AddTextComponentSubstringPlayerName('FLOCK  —  hold [BACKSPACE] to exit')
-    EndTextCommandDisplayText(0.06, 0.895)
-
-    if not online then
-        DrawRect(0.5, 0.5, 1.0, 1.0, 6, 6, 8, 150)
-        SetTextFont(4)
-        SetTextScale(0.6, 0.6)
-        SetTextColour(225, 29, 42, 230)
-        SetTextOutline()
-        SetTextCentre(true)
-        BeginTextCommandDisplayText('STRING')
-        AddTextComponentSubstringPlayerName('NO SIGNAL')
-        EndTextCommandDisplayText(0.5, 0.48)
-        SetTextCentre(false)
-    end
-end
-
-local function DrawConnectingHud()
-    DrawRect(0.5, 0.5, 1.0, 1.0, 6, 6, 8, 200)
-    SetTextFont(4)
-    SetTextScale(0.4, 0.4)
-    SetTextColour(190, 195, 200, 220)
-    SetTextOutline()
-    SetTextCentre(true)
-    BeginTextCommandDisplayText('STRING')
-    AddTextComponentSubstringPlayerName('CONNECTING' .. ('.'):rep(1 + (math.floor(GetGameTimer() / 300) % 3)))
-    EndTextCommandDisplayText(0.5, 0.48)
-    SetTextCentre(false)
-end
-
--- ─── Feed traffic ───────────────────────────────────────────────────
--- Scripted-in vehicles near the camera, standing in for the ambient
--- traffic GTA won't spawn there on its own (see StartFeed). Every vehicle
--- and driver is created non-networked (the trailing `false, false`), so
--- it exists purely on this client — nobody else's game ever sees it.
-
-local function ClearFeedTraffic()
-    for _, e in ipairs(feedTraffic) do
-        DeleteEntitySafe(e.ped)
-        DeleteEntitySafe(e.veh)
-    end
-    feedTraffic = {}
-end
-
-local function SpawnFeedTraffic(coords)
-    local cfg = Config.FeedTraffic
-    if not cfg or not cfg.enabled then return end
-
-    for i = 1, cfg.vehicleCount do
-        -- Jitter the query point per vehicle so they land at different
-        -- road nodes instead of stacking on the single closest one.
-        local angle  = math.random() * 2 * math.pi
-        local radius = math.random(5, cfg.searchRadius)
-        local qx = coords.x + math.cos(angle) * radius
-        local qy = coords.y + math.sin(angle) * radius
-
-        local found, pos, heading = GetClosestVehicleNodeWithHeading(qx, qy, coords.z, 1, 3.0, 0)
-
-        if found then
-            local model       = cfg.models[math.random(1, #cfg.models)]
-            local driverModel = cfg.driverModels[math.random(1, #cfg.driverModels)]
-
-            local vHash = LoadModel(model)
-            local dHash = vHash and LoadModel(driverModel)
-
-            if vHash and dHash then
-                local veh = CreateVehicle(vHash, pos.x, pos.y, pos.z, heading, false, false)
-                SetEntityAsMissionEntity(veh, true, true)
-                SetVehicleOnGroundProperly(veh)
-                SetModelAsNoLongerNeeded(vHash)
-
-                local driver = CreatePedInsideVehicle(veh, 4, dHash, -1, false, false)
-                SetEntityAsMissionEntity(driver, true, true)
-                SetModelAsNoLongerNeeded(dHash)
-                SetDriverAbility(driver, 1.0)
-                SetPedFleeAttributes(driver, 0, false)
-                SetBlockingOfNonTemporaryEvents(driver, true)
-                TaskVehicleDriveWander(driver, veh, cfg.driveSpeed, cfg.drivingStyle)
-
-                feedTraffic[#feedTraffic + 1] = { veh = veh, ped = driver }
-            end
-        end
-        -- A failed node lookup just means one fewer vehicle this round —
-        -- not worth retrying, the feed still works fine with less traffic.
-    end
-end
-
-local function ExitFeed()
-    if not inFeed then return end
-    inFeed = false
-    feedCameraId = nil
-
-    -- Instant cut, no ease — this is a fixed monitor feed, not a flyover.
-    -- Easing over distance is exactly what dragged the view across the
-    -- whole map on the way out.
-    RenderScriptCams(false, false, 0, true, true)
-    if feedCam and DoesCamExist(feedCam) then DestroyCam(feedCam, false) end
-    feedCam = nil
-    ClearFocus()
-    ClearFeedTraffic()
-
-    FreezeEntityPosition(PlayerPedId(), false)
-    DisplayRadar(true)
-    SetPlayerControl(PlayerId(), true, 0)
-
-    if GetResourceState('distortionz_cad') == 'started' then
-        pcall(function() exports['distortionz_cad']:ResumeFromFeed() end)
-    end
-end
-
---- Called by distortionz_cad's "View Feed" button (same-client export call,
---- no server round trip — the camera prop and coords are already cached
---- locally from spawn).
-local function StartFeed(cameraId)
-    if inFeed then return end
-
-    local entry = cameras[cameraId]
-    if not entry then
-        Notify('Unknown camera.', 'error')
-        return
-    end
-
-    local c = entry.cfg.coords
-
-    inFeed          = true
-    feedCameraId    = cameraId
-    -- Captured on entry so any damage taken while "at the terminal" kicks
-    -- the officer straight out — the ped stays fully visible and
-    -- vulnerable at its real location the whole time, so this matters.
-    feedEnterHealth = GetEntityHealth(PlayerPedId())
-
-    FreezeEntityPosition(PlayerPedId(), true)
-    DisplayRadar(false)
-    SetPlayerControl(PlayerId(), false, 0)
-
-    CreateThread(function()
-        -- Static geometry (roads/buildings) streams around a focus point —
-        -- this alone is enough for that. Ambient population (the actual
-        -- traffic an ALPR camera needs to see) does NOT follow a focus
-        -- point, only the real player ped's position, and the ped is
-        -- staying put — so traffic is scripted in separately below instead
-        -- of relying on the population system at all.
-        SetFocusPosAndVel(c.x, c.y, c.z, 0.0, 0.0, 0.0)
-
-        local deadline = GetGameTimer() + 1200
-        while GetGameTimer() < deadline and inFeed and feedCameraId == cameraId do
-            RequestCollisionAtCoord(c.x, c.y, c.z)
-            DrawConnectingHud()
-            Wait(0)
-        end
-
-        -- Exited (or tapped a different camera) while this was still
-        -- streaming in — don't activate a cam nobody asked for anymore.
-        if not inFeed or feedCameraId ~= cameraId then
-            ClearFocus()
-            return
-        end
-
-        SpawnFeedTraffic(c)
-
-        -- Camera starts pointed the way it's mounted, at default zoom; all
-        -- of that is relative from here, reset fresh every time a feed
-        -- is opened.
-        feedPan  = c.w or 0.0
-        feedTilt = -6.0
-        feedFov  = Config.FeedControl.defaultFov
-
-        feedCam = CreateCam('DEFAULT_SCRIPTED_CAMERA', true)
-        SetCamCoord(feedCam, c.x, c.y, c.z + 0.35)
-        SetCamRot(feedCam, feedTilt, 0.0, feedPan, 2)
-        SetCamFov(feedCam, feedFov)
-        SetCamActive(feedCam, true)
-        -- Instant cut, no ease — a CCTV feed switches on, it doesn't fly the
-        -- viewer's camera across the map to get there.
-        RenderScriptCams(true, false, 0, true, true)
-    end)
-end
-
-exports('StartFeed', StartFeed)
-exports('StopFeed', ExitFeed)
-
-RegisterCommand('flockexitfeed', ExitFeed, false)
-RegisterKeyMapping('flockexitfeed', 'Exit Flock camera feed', 'keyboard', 'BACK')
-
-CreateThread(function()
-    while true do
-        if not inFeed then
-            Wait(500)
-        else
-            local ped = PlayerPedId()
-
-            if GetEntityHealth(ped) < feedEnterHealth then
-                ExitFeed()
-            else
-                DisableControlAction(0, 24, true)  -- attack
-                DisableControlAction(0, 25, true)  -- aim
-                DisableControlAction(0, 37, true)  -- weapon wheel
-                DisableControlAction(0, 22, true)  -- jump
-
-                -- feedCam only exists once the pre-roll stream-in thread
-                -- finishes; until then that thread is drawing its own
-                -- CONNECTING overlay, so there's nothing to do here.
-                if feedCam then
-                    local entry = cameras[feedCameraId]
-                    if entry then
-                        -- WASD (32-35, the normal movement controls). They
-                        -- already do nothing while a feed is open — player
-                        -- control is off — so repurposing them for look is a
-                        -- clean swap, not a conflict. Pan wraps the full
-                        -- 360°; Lua's % already handles the negative-heading
-                        -- wrap correctly. Tilt is clamped so it can't flip
-                        -- past vertical.
-                        local dt = GetFrameTime()
-                        local fc = Config.FeedControl
-
-                        -- SetPlayerControl(false) suppresses plain
-                        -- IsControlPressed for far more than the handful of
-                        -- controls disabled above. Disable these ourselves
-                        -- and read the disabled-input variant, which is
-                        -- built to see through exactly that.
-                        DisableControlAction(0, 32, true)  -- W, up
-                        DisableControlAction(0, 33, true)  -- S, down
-                        DisableControlAction(0, 34, true)  -- A, left
-                        DisableControlAction(0, 35, true)  -- D, right
-
-                        if IsDisabledControlPressed(0, 34) then  -- A
-                            feedPan = (feedPan + fc.panSpeed * dt) % 360.0
-                        end
-                        if IsDisabledControlPressed(0, 35) then  -- D
-                            feedPan = (feedPan - fc.panSpeed * dt) % 360.0
-                        end
-                        if IsDisabledControlPressed(0, 32) then  -- W, up
-                            feedTilt = math.min(fc.maxPitch, feedTilt + fc.tiltSpeed * dt)
-                        end
-                        if IsDisabledControlPressed(0, 33) then  -- S, down
-                            feedTilt = math.max(fc.minPitch, feedTilt - fc.tiltSpeed * dt)
-                        end
-
-                        -- Scroll wheel zoom. Each tick is a discrete pulse,
-                        -- not a hold, so JustPressed (one step per tick)
-                        -- rather than Pressed (would ramp with frame rate).
-                        DisableControlAction(0, 14, true)  -- wheel up
-                        DisableControlAction(0, 15, true)  -- wheel down
-
-                        if IsDisabledControlJustPressed(0, 14) then  -- wheel up = zoom out
-                            feedFov = math.min(fc.maxFov, feedFov + fc.zoomStep)
-                        end
-                        if IsDisabledControlJustPressed(0, 15) then  -- wheel down = zoom in
-                            feedFov = math.max(fc.minFov, feedFov - fc.zoomStep)
-                        end
-
-                        SetCamRot(feedCam, feedTilt, 0.0, feedPan, 2)
-                        SetCamFov(feedCam, feedFov)
-
-                        DrawFeedHud(entry.cfg.label or feedCameraId, feedCameraId, cameraState[feedCameraId] ~= false)
-                    else
-                        ExitFeed()
-                    end
-                end
-            end
-
-            Wait(0)
-        end
-    end
-end)
-
 -- ─── Bootstrap ──────────────────────────────────────────────────────
 
 CreateThread(function()
@@ -805,9 +499,6 @@ end)
 
 AddEventHandler('onResourceStop', function(resourceName)
     if resourceName ~= GetCurrentResourceName() then return end
-
-    -- A restart mid-feed must never leave the officer frozen with no radar.
-    ExitFeed()
 
     for _, entry in pairs(cameras) do
         DeleteEntitySafe(entry.prop)

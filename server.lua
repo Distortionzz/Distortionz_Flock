@@ -12,11 +12,19 @@ local cameraById   = {}   -- [id]   = cfg
 local cameraGrid   = {}   -- ['cx:cy'] = { cfg, ... }
 local disabledUntil= {}   -- [id]   = os.time() when the camera comes back
 local lastRead     = {}   -- ['id|plate'] = os.time()
+local lastFine     = {}   -- ['id|plate'] = os.time()
 local hotlist      = {}   -- [plate] = { reason, added_by }
 local readQueue    = {}   -- pending rows, flushed as one INSERT
 local searchStamps = {}   -- [src]  = { os.time(), ... } rolling rate limit
 
-local CELL, RADIUS, VBAND
+-- Cross-tick vehicle position for the speed-camera anti-tunnel check.
+-- [src] = { netId, x, y, z, t }. Rebuilt from scratch every scan tick
+-- (see the main CreateThread below) rather than mutated in place — a
+-- disconnected/parked/switched-vehicle entry just isn't written into the
+-- fresh table, so it disappears on its own with no separate sweep.
+local lastVehState = {}
+
+local CELL, RADIUS
 
 local function DebugPrint(message)
     if Config.Debug then
@@ -30,9 +38,13 @@ end
 --- so a vehicle only ever tests the cameras in its own cell. Cost stays
 --- flat no matter how many cameras the config grows to.
 local function BuildIndex()
-    CELL   = Config.Detection.cellSize
-    RADIUS = Config.Detection.captureRadius
-    VBAND  = Config.Detection.verticalBand
+    CELL = Config.Detection.cellSize
+    -- Bucket footprint must cover whichever detection radius is larger —
+    -- ALPR's and speed's are independently configured, and a camera under-
+    -- registered in the grid would silently miss detections at the edge.
+    -- The actual per-mode hit test below still uses each mode's own exact
+    -- radius; this only controls which cells a camera is discoverable in.
+    RADIUS = math.max(Config.Detection.captureRadius, Config.SpeedDetection.captureRadius)
 
     if CELL < RADIUS * 2 then
         CELL = RADIUS * 2
@@ -79,6 +91,45 @@ local function IsCameraOnline(id)
     end
 
     return false
+end
+
+local function HasMode(cfg, mode)
+    local modes = cfg.modes
+    if not modes then return false end
+
+    for i = 1, #modes do
+        if modes[i] == mode then return true end
+    end
+
+    return false
+end
+
+-- Shortest 2D distance from point (px,py) to the segment (ax,ay)->(bx,by).
+-- Ported from distortionz_speedcam's client-side version, now run
+-- server-side against the server's own cross-tick position samples — a
+-- fast pass between two scan ticks still can't tunnel past a camera.
+local function DistPointToSeg2D(px, py, ax, ay, bx, by)
+    local abx, aby = bx - ax, by - ay
+    local ab2 = abx * abx + aby * aby
+    local t = 0.0
+
+    if ab2 > 0 then
+        t = ((px - ax) * abx + (py - ay) * aby) / ab2
+        if t < 0.0 then t = 0.0 elseif t > 1.0 then t = 1.0 end
+    end
+
+    local qx, qy = ax + abx * t, ay + aby * t
+    local dx, dy = px - qx, py - qy
+
+    return math.sqrt(dx * dx + dy * dy)
+end
+
+local function SpeedFromMs(ms)
+    if Config.SpeedDetection.unit == 'kmh' then
+        return ms * 3.6
+    end
+
+    return ms * 2.236936
 end
 
 -- ─── Framework bridge ───────────────────────────────────────────────
@@ -277,21 +328,159 @@ local function ReadPlate(vehicle)
     return NormalizePlate(plate)
 end
 
+-- ─── Speed camera fine ──────────────────────────────────────────────
+-- Ported from distortionz_speedcam, unchanged apart from Collect's nil-
+-- player guard (this resource works standalone, without qbx_core).
+
+local function ComputeFine(speed, limit)
+    local over = speed - limit
+    if over <= 0 then return 0 end
+
+    local f = Config.Fine.base + (Config.Fine.perUnitOver * over)
+    f = math.floor(f + 0.5)
+
+    if f < Config.Fine.min then f = Config.Fine.min end
+    if f > Config.Fine.max then f = Config.Fine.max end
+
+    return f
+end
+
+--- Returns the account actually billed ('bank'/'cash'), or nil if no
+--- qbx_core (standalone) or neither account could cover it.
+local function Collect(player, amount)
+    if not player then return nil end
+
+    local paid = player.Functions.RemoveMoney(Config.Fine.account, amount, Config.Fine.reason)
+    if paid then return Config.Fine.account end
+
+    if Config.Fine.fallback then
+        paid = player.Functions.RemoveMoney(Config.Fine.fallback, amount, Config.Fine.reason)
+        if paid then return Config.Fine.fallback end
+    end
+
+    return nil
+end
+
+--- Chance-based dispatch ping for a speeding violation — distinct from
+--- FireHit (hotlist/BOLO), which always fires. Uses GetOfficers() like
+--- everything else here, so "who's police" is one definition resource-wide.
+local function FireSpeedAlert(cfg, speed, limit, plate)
+    if not Config.SpeedAlert.enabled then return end
+    if math.random() > (Config.SpeedAlert.chance or 1.0) then return end
+
+    local c = cfg.coords
+    local label = ('%s — plate %s'):format(Config.SpeedAlert.label, plate ~= '' and plate or 'UNKNOWN')
+
+    if Config.SpeedAlert.useCad and GetResourceState('distortionz_cad') == 'started' then
+        pcall(function()
+            exports['distortionz_cad']:AddCall({
+                code     = Config.SpeedAlert.code,
+                title    = label,
+                location = cfg.label or cfg.id,
+                coords   = { x = c.x, y = c.y, z = c.z },
+                priority = Config.SpeedAlert.cadPriority or 3,
+            })
+        end)
+    end
+
+    local delay = math.random(Config.SpeedAlert.delayMs.min or 1500, Config.SpeedAlert.delayMs.max or 4000)
+
+    SetTimeout(delay, function()
+        local officers = GetOfficers()
+        if #officers == 0 then return end
+
+        NotifyMany(officers, ('%s — %s (%d/%d %s)'):format(
+            Config.SpeedAlert.code, label, speed, limit, Config.SpeedDetection.unit), 'police', 9000)
+
+        for i = 1, #officers do
+            TriggerClientEvent('distortionz_flock:client:hit', officers[i], {
+                label         = label,
+                coords        = { x = c.x, y = c.y, z = c.z },
+                blipTimeoutMs = Config.SpeedAlert.blipTimeoutMs,
+            })
+        end
+    end)
+end
+
+--- Server-authoritative cooldown + fine + persistence for one speeding
+--- pass. plate/speed/limit are all derived by the server itself — see
+--- ScanVehicle below — never taken from the client.
+local function RecordSpeedViolation(cfg, plate, citizenid, src, speed, limit)
+    local now = os.time()
+    local key = ('%s|%s'):format(cfg.id, plate)
+
+    if (now - (lastFine[key] or 0)) < Config.SpeedDetection.cooldownSeconds then
+        return
+    end
+
+    lastFine[key] = now
+
+    -- Fire the camera flash immediately — this is the "caught in the act"
+    -- moment, it shouldn't wait on the fine/billing work below. Broadcasts
+    -- to everyone (DrawLightWithRange only actually renders for whoever's
+    -- close enough to see it), not just the driver.
+    local cc = cfg.coords
+    TriggerClientEvent('distortionz_flock:client:cameraFlash', -1, { x = cc.x, y = cc.y, z = cc.z })
+
+    local fine      = ComputeFine(speed, limit)
+    local player    = GetPlayer(src)
+    local paidFrom  = fine > 0 and Collect(player, fine) or nil
+    local unit      = Config.SpeedDetection.unit
+
+    exports.oxmysql:execute(
+        'INSERT INTO `distortionz_flock_speed_violations` '
+        .. '(`camera_id`, `camera_label`, `plate`, `citizenid`, `speed`, `speed_limit`, `fine_amount`, `paid_from`) '
+        .. 'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        { cfg.id, cfg.label or cfg.id, plate, citizenid, speed, limit, fine, paidFrom })
+
+    if fine > 0 then
+        if paidFrom then
+            NotifyOne(src, ('Speed camera: %d %s in a %d %s zone. Fined $%d from %s.'):format(
+                speed, unit, limit, unit, fine, paidFrom), 'error', 8000)
+        elseif player then
+            NotifyOne(src, ('Speed camera: %d %s in a %d %s zone. Unpaid fine of $%d — flagged.'):format(
+                speed, unit, limit, unit, fine), 'error', 8000)
+        else
+            NotifyOne(src, ('Speed camera: %d %s in a %d %s zone. Logged — no billing available.'):format(
+                speed, unit, limit, unit), 'error', 8000)
+        end
+    end
+
+    DebugPrint(('Speed violation %s plate=%s %d/%d %s = $%d (%s)'):format(
+        cfg.id, plate, speed, limit, unit, fine, paidFrom or 'UNPAID'))
+
+    FireSpeedAlert(cfg, speed, limit, plate)
+end
+
 -- ─── Hotlist alert ──────────────────────────────────────────────────
 
+--- Single delivery path for both hotlist and BOLO hits — a hit is a hit.
+--- `entry` carries the reason plus optional per-call overrides (code/
+--- label/blipTimeoutMs/useCad/cadPriority/enabled); anything it doesn't
+--- set falls back to Config.Alert, so the existing hotlist call site
+--- (which never set these) behaves exactly as before.
 local function FireHit(cfg, plate, entry)
-    if not Config.Alert.enabled then return end
+    local enabled = entry.enabled
+    if enabled == nil then enabled = Config.Alert.enabled end
+    if not enabled then return end
+
+    local code          = entry.code or Config.Alert.code
+    local label         = entry.label or Config.Alert.label
+    local blipTimeoutMs = entry.blipTimeoutMs or Config.Alert.blipTimeoutMs
+    local useCad         = entry.useCad
+    if useCad == nil then useCad = Config.Alert.useCad end
+    local cadPriority    = entry.cadPriority or Config.Alert.cadPriority
 
     local c = cfg.coords
 
-    if Config.Alert.useCad and GetResourceState('distortionz_cad') == 'started' then
+    if useCad and GetResourceState('distortionz_cad') == 'started' then
         pcall(function()
             exports['distortionz_cad']:AddCall({
-                code     = Config.Alert.code,
-                title    = ('%s — plate %s'):format(Config.Alert.label, plate),
+                code     = code,
+                title    = ('%s — plate %s'):format(label, plate),
                 location = cfg.label or cfg.id,
                 coords   = { x = c.x, y = c.y, z = c.z },
-                priority = Config.Alert.cadPriority or 1,
+                priority = cadPriority or 1,
             })
         end)
     end
@@ -303,16 +492,16 @@ local function FireHit(cfg, plate, entry)
         if #officers == 0 then return end
 
         NotifyMany(officers, ('%s — plate %s at %s (%s)'):format(
-            Config.Alert.code,
+            code,
             plate,
             cfg.label or cfg.id,
             entry.reason or 'no reason given'), 'police', 10000)
 
         for i = 1, #officers do
             TriggerClientEvent('distortionz_flock:client:hit', officers[i], {
-                label         = ('%s — %s'):format(Config.Alert.label, plate),
+                label         = ('%s — %s'):format(label, plate),
                 coords        = { x = c.x, y = c.y, z = c.z },
-                blipTimeoutMs = Config.Alert.blipTimeoutMs,
+                blipTimeoutMs = blipTimeoutMs,
             })
         end
     end)
@@ -345,34 +534,105 @@ local function RecordRead(cfg, plate, citizenid)
         FireHit(cfg, plate, entry)
     end
 
+    -- Independent of the hotlist check above — a plate can be both
+    -- hotlisted and BOLO'd, and both alerts should fire. Restricted to
+    -- type='Vehicle' BOLOs on CAD's side (see CheckVehicleBolo), so a
+    -- Person BOLO's free-text reference field can't false-positive here.
+    if Config.Bolo.enabled and GetResourceState('distortionz_cad') == 'started' then
+        local ok, bolo = pcall(function()
+            return exports['distortionz_cad']:CheckVehicleBolo(plate)
+        end)
+
+        if ok and bolo then
+            FireHit(cfg, plate, {
+                reason        = bolo.title or bolo.details or 'Active BOLO',
+                code          = Config.Bolo.code,
+                label         = Config.Bolo.label,
+                blipTimeoutMs = Config.Bolo.blipTimeoutMs,
+                useCad        = Config.Bolo.useCad,
+                cadPriority   = Config.Bolo.cadPriority,
+                enabled       = Config.Bolo.enabled,
+            })
+        end
+    end
+
     return true
 end
 
-local function ScanVehicle(vehicle, citizenid)
-    if not DoesEntityExist(vehicle) then return end
+--- One pass over every camera near this vehicle, doing whichever of
+--- ALPR/speed each camera is configured for (HasMode). `prevState` is
+--- this vehicle's `src`'s last-tick sample (nil on first sighting or a
+--- requireOccupant=false pass); `canSpeedTest` is false for a passenger
+--- when Config.SpeedDetection.driverOnly is set, and always false in the
+--- requireOccupant=false branch (no stable src to bill or track there —
+--- a documented limitation, not a silent gap). Returns this tick's
+--- position sample (or nil if canSpeedTest is false) for the caller to
+--- store as next tick's prevState.
+local function ScanVehicle(vehicle, src, citizenid, prevState, canSpeedTest)
+    if not DoesEntityExist(vehicle) then return nil end
 
-    local pos     = GetEntityCoords(vehicle)
-    local nearby  = CamerasNear(pos.x, pos.y)
-    if not nearby then return end
+    local pos    = GetEntityCoords(vehicle)
+    local nearby = CamerasNear(pos.x, pos.y)
+
+    local curState, ps
+    if canSpeedTest then
+        local netId = NetworkGetNetworkIdFromEntity(vehicle)
+        curState = { netId = netId, x = pos.x, y = pos.y, z = pos.z }
+        -- First-ever sample of this src's vehicle, or a mid-tick vehicle
+        -- swap: treat as a zero-length segment (point test) rather than
+        -- skipping the tick entirely — mirrors distortionz_speedcam's
+        -- original "prev = lastPos or cur" first-sample behavior.
+        ps = (prevState and prevState.netId == netId) and prevState or curState
+    end
+
+    if not nearby then return curState end
+
+    local plate -- read lazily, at most once, shared by both modes below
 
     for i = 1, #nearby do
         local cfg = nearby[i]
 
         if IsCameraOnline(cfg.id) then
-            local c     = cfg.coords
-            local dx    = pos.x - c.x
-            local dy    = pos.y - c.y
-            local horiz = math.sqrt(dx * dx + dy * dy)
+            local c = cfg.coords
 
-            if horiz <= RADIUS and math.abs(pos.z - c.z) <= VBAND then
-                local plate = ReadPlate(vehicle)
+            if HasMode(cfg, 'alpr') then
+                local dx, dy = pos.x - c.x, pos.y - c.y
+                local horiz  = math.sqrt(dx * dx + dy * dy)
 
-                if plate then
-                    RecordRead(cfg, plate, citizenid)
+                if horiz <= Config.Detection.captureRadius and math.abs(pos.z - c.z) <= Config.Detection.verticalBand then
+                    plate = plate or ReadPlate(vehicle)
+                    if plate then RecordRead(cfg, plate, citizenid) end
+                end
+            end
+
+            if canSpeedTest and cfg.limit and HasMode(cfg, 'speed') then
+                -- Segment-tested against the path travelled since last
+                -- tick, not just the current point — a fast pass can't
+                -- tunnel between two 1-second samples.
+                local horiz = DistPointToSeg2D(c.x, c.y, ps.x, ps.y, pos.x, pos.y)
+                local vert  = math.min(math.abs(pos.z - c.z), math.abs(ps.z - c.z))
+
+                if Config.Debug and horiz <= Config.SpeedDetection.captureRadius * 3.0 then
+                    DebugPrint(('Near speed cam %s: h=%.1f v=%.1f speed=%.0f limit=%d'):format(
+                        cfg.id, horiz, vert, SpeedFromMs(GetEntitySpeed(vehicle)), cfg.limit))
+                end
+
+                if horiz <= Config.SpeedDetection.captureRadius and vert <= Config.SpeedDetection.verticalBand then
+                    local speedVal = SpeedFromMs(GetEntitySpeed(vehicle))
+                    local trip     = cfg.limit + (Config.SpeedDetection.tolerance or 0)
+
+                    if speedVal > trip then
+                        plate = plate or ReadPlate(vehicle)
+                        if plate then
+                            RecordSpeedViolation(cfg, plate, citizenid, src, math.floor(speedVal + 0.5), cfg.limit)
+                        end
+                    end
                 end
             end
         end
     end
+
+    return curState
 end
 
 CreateThread(function()
@@ -380,6 +640,8 @@ CreateThread(function()
         Wait(Config.Detection.intervalMs)
 
         if Config.Detection.requireOccupant then
+            local newVehState = {}
+
             -- Only players' vehicles can matter: ambient NPC traffic is
             -- client-side and never networked to the server anyway.
             for _, sid in ipairs(GetPlayers()) do
@@ -390,13 +652,25 @@ CreateThread(function()
                     local veh = GetVehiclePedIsIn(ped)
 
                     if veh and veh ~= 0 then
-                        ScanVehicle(veh, GetCitizenId(src))
+                        local canSpeedTest = not Config.SpeedDetection.driverOnly
+                            or GetPedInVehicleSeat(veh, -1) == ped
+
+                        local state = ScanVehicle(veh, src, GetCitizenId(src), lastVehState[src], canSpeedTest)
+                        if state then newVehState[src] = state end
                     end
                 end
             end
+
+            -- Wholesale replace, not mutate-and-prune: a disconnected
+            -- player, a parked car, or someone who got out simply isn't
+            -- written into the fresh table and disappears with it.
+            lastVehState = newVehState
         else
+            -- No stable src here to bill or track across ticks, so speed
+            -- detection is skipped entirely in this mode — ALPR (which
+            -- doesn't need a src) still runs normally.
             for _, veh in ipairs(GetAllVehicles()) do
-                ScanVehicle(veh, nil)
+                ScanVehicle(veh, nil, nil, nil, false)
             end
         end
     end
@@ -563,11 +837,6 @@ end
 lib.callback.register('distortionz_flock:server:getCameras', function(source)
     return BuildCameraList(source)
 end)
-
---- Server-to-server call for other resources (e.g. distortionz_cad's
---- Cameras tab). Re-checks access itself — never trust that the calling
---- resource already gated it.
-exports('GetCameras', BuildCameraList)
 
 -- ─── Counterplay ────────────────────────────────────────────────────
 

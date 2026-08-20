@@ -1,14 +1,13 @@
 Config = {}
 
-Config.Debug = false   -- prints scan/read lines. Set false before shipping.
+Config.Debug = true   -- prints scan/read lines. Set false before shipping.
 
 Config.ResourceName   = 'distortionz_flock'
-Config.CurrentVersion = '1.1.0'
+Config.CurrentVersion = '2.0.0'
 
 -- ─── Version checker ────────────────────────────────────────────────
 Config.VersionCheck = {
-    -- Enable once the repo exists on GitHub.
-    enabled      = false,
+    enabled      = true,
     url          = 'https://raw.githubusercontent.com/Distortionzz/Distortionz_Flock/main/version.json',
     checkOnStart = true,
 }
@@ -46,10 +45,42 @@ Config.Detection = {
     cellSize        = 150.0,
 }
 
+-- ─── Speed detection ────────────────────────────────────────────────
+-- Also fully server-side: the server computes speed off its own vehicle
+-- handle (GetEntitySpeed) and reads the plate itself, on the same scan
+-- pass as ALPR above — a client never reports a speed or a plate for
+-- this either. Rides Config.Detection.intervalMs, not a separate timer.
+Config.SpeedDetection = {
+    -- 'mph' or 'kmh' — applies to camera limits, fines, and notify text.
+    unit            = 'mph',
+
+    -- A vehicle is captured when the path it travelled *this tick* passes
+    -- within this many metres (horizontal) of a camera while over the
+    -- limit. Segment-tested, not point-tested, so a fast pass can't
+    -- tunnel between two 1-second samples.
+    captureRadius   = 16.0,
+
+    -- Max vertical gap (metres) between vehicle and camera Z.
+    verticalBand    = 8.0,
+
+    -- Grace buffer added on top of the camera limit before a fine fires
+    -- (in the configured unit). Stops borderline/needle-jitter flashes.
+    tolerance       = 4,
+
+    -- Only the driver is fined.
+    driverOnly      = true,
+
+    -- Separate from Config.CooldownSeconds below (that one's for ALPR
+    -- reads/hotlist/BOLO). Same plate + same camera can only be fined
+    -- once per this many seconds.
+    cooldownSeconds = 5,
+}
+
 -- ─── Anti-spam ──────────────────────────────────────────────────────
 -- Server-authoritative. The same plate at the same camera is only
 -- recorded once per this many seconds — stops a car parked in range
--- writing one row per second forever.
+-- writing one row per second forever. ALPR/hotlist/BOLO only — speed
+-- fines use Config.SpeedDetection.cooldownSeconds instead.
 Config.CooldownSeconds = 30
 
 -- ─── Database ───────────────────────────────────────────────────────
@@ -90,6 +121,54 @@ Config.Alert = {
     cadPriority   = 1,
 }
 
+-- ─── BOLO alerts ────────────────────────────────────────────────────
+-- Independent of the hotlist above. Every ALPR read is also checked
+-- against distortionz_cad's own BOLO board (type='Vehicle', status=
+-- 'active' only) — if an officer has put a plate on a BOLO, seeing it
+-- again anywhere fires this, regardless of who's driving or who it's
+-- registered to. Same delivery path as a hotlist hit (FireHit), just a
+-- different trigger and wording.
+Config.Bolo = {
+    enabled       = true,
+    code          = 'BOLO',
+    label         = 'BOLO hit — vehicle',
+    blipTimeoutMs = 60000,
+    useCad        = true,
+    cadPriority   = 1,
+}
+
+-- ─── Speed camera dispatch alert ────────────────────────────────────
+-- Separate from Config.Alert/Config.Bolo above: a speeding pass is a much
+-- more everyday event than a hotlist/BOLO hit, so it's chance-based
+-- rather than always firing. Who counts as "police" for delivery is
+-- GetOfficers() — the same definition used everywhere else in this
+-- resource, not a separate job list.
+Config.SpeedAlert = {
+    enabled       = true,
+    chance        = 1.0,   -- per-violation chance to also ping police (1.0 = every time)
+    delayMs       = { min = 1500, max = 4000 },
+    code          = '10-55',
+    label         = 'Speed camera triggered',
+    blipTimeoutMs = 45000,
+    useCad        = true,
+    cadPriority   = 3,
+}
+
+-- ─── Speed camera fine ──────────────────────────────────────────────
+-- fine = clamp( base + perUnitOver * (speed - limit), min, max ), rounded.
+-- Pulled from the offender's qbx bank first, then cash if bank is short.
+-- No qbx_core running (standalone mode): the violation is still logged,
+-- just not billed.
+Config.Fine = {
+    account     = 'bank',
+    fallback    = 'cash',
+    base        = 250,
+    perUnitOver = 30,
+    min         = 250,
+    max         = 6000,
+    reason      = 'speed-camera-fine',
+}
+
 -- ─── Counterplay ────────────────────────────────────────────────────
 -- Without this, PD is unbeatable and the cameras stop being interesting.
 -- A player near a camera can disable it for a while. The server validates
@@ -120,8 +199,10 @@ Config.Counterplay = {
 
 -- ─── Camera prop ────────────────────────────────────────────────────
 Config.Prop = {
-    -- Deliberately different from distortionz_speedcam's prop_cctv_cam_02a
-    -- so players can tell a plate reader from a speed trap at a glance.
+    -- Every camera is the same dual-purpose (ALPR + speed) unit, so one
+    -- default model for the whole network. Override per-camera via
+    -- Config.Cameras[i].model if you want a specific pole to look
+    -- different — purely cosmetic, doesn't affect what it detects.
     model      = 'prop_cctv_cam_04a',
 
     -- Pole beneath the camera. Set to false for cameras mounted on
@@ -134,74 +215,31 @@ Config.Prop = {
     freeze     = true,
 }
 
--- ─── Feed camera controls ───────────────────────────────────────────
--- Arrow keys pan/tilt while a feed is open. Pan is a full unclamped 360°
--- (a fixed camera can still swivel on its mount); tilt is clamped so it
--- can't flip past straight up/down.
-Config.FeedControl = {
-    panSpeed  = 70.0,   -- degrees/second, left/right
-    tiltSpeed = 55.0,   -- degrees/second, up/down
-    minPitch  = -75.0,
-    maxPitch  = 45.0,
-
-    -- Mouse wheel zoom. Lower FOV = more zoomed in.
-    defaultFov = 50.0,
-    zoomStep   = 4.0,   -- FOV degrees per scroll tick
-    minFov     = 15.0,  -- most zoomed in
-    maxFov     = 65.0,  -- most zoomed out
-}
-
--- ─── Feed traffic ───────────────────────────────────────────────────
--- GTA's ambient population only spawns around the real player ped, not a
--- focus point — so an officer's ped stays exactly where they physically
--- are (visible, untouched) and this scripts in a handful of vehicles near
--- the camera instead. Local-only: never networked, never seen by anyone
--- but the viewing officer, despawned the moment the feed closes.
-Config.FeedTraffic = {
-    enabled      = true,
-    vehicleCount = 4,
-    searchRadius = 35.0,   -- how far from the camera to look for road nodes
-
-    models = {
-        'asea', 'ingot', 'premier', 'stanier', 'tailgater',
-        'washington', 'blista', 'primo', 'oracle', 'emperor',
-    },
-    driverModels = {
-        'a_m_y_business_01', 'a_m_m_business_01',
-        'a_f_y_business_02', 'a_m_y_soucent_01',
-    },
-
-    driveSpeed   = 12.0,     -- m/s, roughly city street pace
-    drivingStyle = 786603,   -- normal: obeys traffic, avoids cars
-}
-
 -- ─── Cameras ────────────────────────────────────────────────────────
 -- coords  : vec4(x, y, z, heading) — z/heading are the PROP placement.
--- id      : stable key, used for cooldowns and the reads table.
+-- id      : stable key, used for cooldowns and the reads/violations tables.
 -- label   : human name shown to officers in search results and alerts.
+-- modes   : REQUIRED. { 'alpr' }, { 'speed' }, or { 'alpr', 'speed' } —
+--           one camera, one job, both, or a combo pole.
+-- limit   : speed limit in Config.SpeedDetection.unit. Required if 'speed'
+--           is in modes, ignored otherwise.
 -- model   : (optional) per-camera prop override.
 -- pole    : (optional) per-camera pole override, or false for none.
--- enabled : (optional) set false to disable a single camera.
+-- enabled : (optional) set false to disable a single camera (both modes).
+-- blip    : (optional) { sprite=, color=, scale=, label= } per-camera
+--           override of Config.Blip.
 --
--- NOTE: these are seeded placements and the Z values are approximate.
--- Stand where you want each one and use distortionz_coords to capture an
--- exact vec4, then paste it in. Verify before shipping.
+-- NOTE: none of these are field-verified. Stand where you want each one
+-- and use distortionz_coords to capture an exact vec4, then paste it in.
+-- Verify before shipping.
+--
+-- Every camera is dual-mode (alpr + speed) — one uniform network, every
+-- pole does both jobs.
 Config.Cameras = {
-    { id = 'elysian_fwy',      label = 'Elysian Fields Fwy',   coords = vec4(  424.0, -1830.0,  29.0, 140.0) },
-    { id = 'olympic_fwy_e',    label = 'Olympic Fwy East',     coords = vec4( -430.0, -1200.0,  30.0, 320.0) },
-    { id = 'la_puerta_under',  label = 'La Puerta Underpass',  coords = vec4(-1180.0, -1560.0,   5.0, 210.0) },
-    { id = 'del_perro_fwy_n',  label = 'Del Perro Fwy North',  coords = vec4(-1480.0,  -540.0,  32.0, 300.0) },
-    { id = 'vinewood_hills',   label = 'Vinewood Hills Rd',    coords = vec4(  680.0,   580.0, 129.0, 190.0) },
-    { id = 'senora_fwy_s',     label = 'Senora Fwy South',     coords = vec4( 2380.0,  2540.0,  47.0,  60.0) },
-    { id = 'route68_harmony',  label = 'Route 68 — Harmony',   coords = vec4( 1180.0,  2660.0,  38.0,  90.0) },
-    { id = 'great_ocean_chum', label = 'Great Ocean Hwy',      coords = vec4(-3080.0,  1140.0,  20.0, 240.0) },
-    { id = 'paleto_blvd',      label = 'Paleto Blvd',          coords = vec4( -320.0,  6240.0,  31.0,  45.0) },
-    { id = 'grapeseed_main',   label = 'Grapeseed Main St',    coords = vec4( 1700.0,  4780.0,  42.0,  15.0) },
-    { id = 'zancudo_rd',       label = 'Zancudo Rd',           coords = vec4(-2100.0,  3200.0,  32.0, 150.0) },
-    { id = 'legion_sq',        label = 'Legion Square',        coords = vec4(  200.0,  -940.0,  30.0, 160.0) },
-    { id = 'mirror_park',      label = 'Mirror Park Blvd',     coords = vec4( 1120.0,  -640.0,  56.0, 270.0) },
-    { id = 'strawberry_ave',   label = 'Strawberry Ave',       coords = vec4(  180.0, -1680.0,  29.0, 230.0) },
-    { id = 'port_of_ls',       label = 'Port of LS',           coords = vec4(  830.0, -2960.0,   5.0,  90.0) },
+    { id = 'elysian_fwy',   label = 'Elysian Fields Fwy', coords = vec4(424.0, -1830.0, 29.0, 140.0),
+      modes = { 'alpr', 'speed' }, limit = 65 },
+    { id = 'olympic_fwy_e', label = 'Olympic Fwy East',   coords = vec4(-429.20, -1196.40, 19.63, 352.3),
+      modes = { 'alpr', 'speed' }, limit = 65 },
 }
 
 -- ─── Blips ──────────────────────────────────────────────────────────
