@@ -1,6 +1,6 @@
 Config = {}
 
-Config.Debug = true   -- prints scan/read lines. Set false before shipping.
+Config.Debug = false       -- prints scan/read lines. Set false before shipping.
 
 Config.ResourceName   = 'distortionz_flock'
 Config.CurrentVersion = '2.0.0'
@@ -203,7 +203,7 @@ Config.Prop = {
     -- default model for the whole network. Override per-camera via
     -- Config.Cameras[i].model if you want a specific pole to look
     -- different — purely cosmetic, doesn't affect what it detects.
-    model      = 'prop_cctv_cam_04a',
+    model      = 'prop_cctv_unit_01',
 
     -- Pole beneath the camera. Set to false for cameras mounted on
     -- existing world geometry (gantries, overpasses) where a pole clips.
@@ -236,9 +236,12 @@ Config.Prop = {
 -- Every camera is dual-mode (alpr + speed) — one uniform network, every
 -- pole does both jobs.
 Config.Cameras = {
-    { id = 'elysian_fwy',   label = 'Elysian Fields Fwy', coords = vec4(424.0, -1830.0, 29.0, 140.0),
+    { id = 'olympic_fwy_e', label = 'Olympic Fwy East',   coords = vec4(-429.20, -1196.40, 19.63, 262.3),
       modes = { 'alpr', 'speed' }, limit = 65 },
-    { id = 'olympic_fwy_e', label = 'Olympic Fwy East',   coords = vec4(-429.20, -1196.40, 19.63, 352.3),
+    -- Field-captured, not a placeholder. Heading nudged 90° from capture
+    -- so the two lenses split across both directions of travel instead
+    -- of both favoring one lane — adjust further if it's not quite right.
+    { id = 'la_puerta_hwy', label = 'La Puerta Highway',  coords = vec4(-631.05, -1721.93, 36.85, 196.97),
       modes = { 'alpr', 'speed' }, limit = 65 },
 }
 
